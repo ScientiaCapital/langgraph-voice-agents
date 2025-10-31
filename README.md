@@ -64,69 +64,188 @@ All agents follow the systematic MCP tool order:
 
 ## 🚀 Quick Start
 
-### Prerequisites
-```bash
-# Install dependencies
-pip install -r requirements.txt
+### Installation
 
-# Set up environment variables
+#### Option 1: Install from source (recommended for development)
+```bash
+# Clone the repository
+git clone https://github.com/ScientiaCapital/langgraph-voice-agents.git
+cd langgraph-voice-agents
+
+# Install with development dependencies
+make install-dev
+
+# Or manually:
+pip install -e ".[dev]"
+```
+
+#### Option 2: Install as package
+```bash
+pip install langgraph-voice-agents
+```
+
+### Environment Setup
+```bash
+# Create .env file from template
+make env-setup
+
+# Or manually:
 cp .env.example .env
+
 # Edit .env with your API keys
+# At minimum: OPENAI_API_KEY, LANGCHAIN_API_KEY
+```
+
+### Run Your First Demo
+```bash
+# Run basic demo (no LiveKit required)
+make run-demo
+
+# Or manually:
+python examples/basic_demo.py
+```
+
+### Verify Installation
+```bash
+# Run structural validation
+make structure-test
+
+# Run all tests (if dependencies installed)
+make test
 ```
 
 ### Basic Usage
 ```python
-from agents.task_orchestrator import TaskOrchestratorAgent
-from voice.livekit_client import create_livekit_client
+import asyncio
+from agents import TaskOrchestrator, TaskExecutor, TaskChecker
+from core import AgentMode
 
-# Create voice-enabled orchestrator
-livekit_client = await create_livekit_client(
-    agent_type="orchestrator",
-    session_id="demo-session",
-    participant_name="AI-Agent",
-    livekit_url="wss://your-livekit-server.com",
-    api_key="your-api-key",
-    api_secret="your-api-secret",
-    openai_api_key="your-openai-key"
+async def main():
+    # Create agents in TEXT mode (no voice required)
+    orchestrator = TaskOrchestrator(mode=AgentMode.TEXT)
+    executor = TaskExecutor(mode=AgentMode.TEXT)
+    checker = TaskChecker(mode=AgentMode.TEXT)
+
+    # Process a task
+    task = "Build a REST API with JWT authentication"
+
+    # Step 1: Plan with orchestrator
+    plan = await orchestrator.process_input(task)
+    print(f"Plan: {plan['status']}")
+
+    # Step 2: Execute with executor
+    result = await executor.process_input(task)
+    print(f"Execution: {result['status']}")
+
+    # Step 3: Validate with checker
+    validation = await checker.process_input(f"Validate: {task}")
+    print(f"Validation: {validation['status']}")
+
+if __name__ == "__main__":
+    asyncio.run(main())
+```
+
+### Voice-Enabled Usage (requires LiveKit)
+```python
+from agents import TaskOrchestrator
+from voice import LiveKitConfig
+from core import AgentMode
+import os
+
+# Configure LiveKit
+config = LiveKitConfig(
+    url=os.getenv('LIVEKIT_URL'),
+    api_key=os.getenv('LIVEKIT_API_KEY'),
+    api_secret=os.getenv('LIVEKIT_API_SECRET'),
+    room_name="agent-session"
 )
 
-agent = TaskOrchestratorAgent(
-    session_id="demo-session",
-    livekit_client=livekit_client
+# Create voice-enabled agent
+agent = TaskOrchestrator(
+    mode=AgentMode.VOICE,
+    livekit_config=config
 )
 
-# Run via voice or text
-result = await agent.run({
-    "messages": [],
-    "task_description": "Build a REST API with authentication"
-})
+# Process voice or text input
+result = await agent.process_input("Design a microservices architecture")
+```
+
+## 📋 Common Commands
+
+```bash
+# Development
+make install          # Install package
+make install-dev      # Install with dev dependencies
+make clean            # Clean build artifacts
+
+# Testing
+make test             # Run all tests
+make test-unit        # Unit tests only
+make test-integration # Integration tests only
+make lint             # Run linting
+make format           # Format code
+
+# Usage
+make run-demo         # Run basic demo
+make run-voice-demo   # Run voice demo (requires LiveKit)
+make validate         # Run all validation checks
+
+# Setup
+make dev-setup        # Complete dev environment setup
+make env-setup        # Create .env from template
+make env-check        # Check environment variables
+
+# Information
+make help             # Show all commands
+make info             # Project information
 ```
 
 ## 📁 Project Structure
 
 ```
-langgraph-flows/
-├── agents/                 # Core agent implementations
+langgraph-voice-agents/
+├── agents/                     # Core agent implementations
+│   ├── __init__.py             # Agent exports
 │   ├── task_orchestrator.py   # Strategic planning agent
 │   ├── task_executor.py       # Implementation agent
 │   └── task_checker.py        # Quality assurance agent
-├── core/                   # Framework foundation
-│   ├── base_agent.py          # Base agent class
-│   ├── base_graph.py          # Graph utilities
-│   ├── multimodal_mixin.py    # Voice/text support
-│   └── state_management.py    # State persistence
-├── tools/                  # MCP tool adapters
+├── core/                       # Framework foundation
+│   ├── __init__.py             # Core exports
+│   ├── base_graph.py          # BaseAgent, AgentState, AgentMode
+│   └── state_management.py    # StateManager, ExecutionState
+├── tools/                      # MCP tool adapters
+│   ├── __init__.py             # Tool exports
 │   ├── sequential_thinking_tools.py
 │   ├── serena_tools.py
 │   ├── context7_tools.py
 │   ├── taskmaster_tools.py
 │   ├── shrimp_tools.py
 │   └── desktop_commander_tools.py
-├── voice/                  # Voice integration
+├── voice/                      # Voice integration
+│   ├── __init__.py             # Voice exports
 │   └── livekit_client.py      # LiveKit WebRTC client
-├── examples/               # Usage examples
-├── tests/                  # Test suites
-└── patterns/               # Common workflows
+├── examples/                   # Usage examples
+│   ├── basic_demo.py           # Basic agent usage
+│   ├── voice_demo.py           # Voice-enabled demo
+│   ├── error_handling/         # Error handling examples
+│   └── README.md               # Examples documentation
+├── tests/                      # Test suites
+│   ├── unit/                   # Unit tests
+│   ├── integration/            # Integration tests
+│   ├── voice/                  # Voice tests
+│   ├── conftest.py             # Pytest configuration
+│   └── README.md               # Testing documentation
+├── docs/                       # Documentation
+│   └── API_REFERENCE.md        # Complete API reference
+├── .env.example                # Environment template
+├── Makefile                    # Development commands
+├── pyproject.toml              # Modern Python packaging
+├── setup.py                    # Package configuration
+├── requirements.txt            # Dependencies
+├── test_structure.py           # Structural validation
+├── test_imports.py             # Import smoke tests
+├── README.md                   # This file
+└── CLAUDE.md                   # Development log
 ```
 
 ## 🔧 Configuration
@@ -160,27 +279,82 @@ agent_config = {
 
 ## 🧪 Testing
 
-Run the comprehensive test suite:
+### Run Tests
 ```bash
-# Unit tests
-pytest tests/unit/
+# All tests with coverage
+make test
 
-# Integration tests
-pytest tests/integration/
+# Unit tests only
+make test-unit
 
-# Voice interaction tests
-pytest tests/voice/
+# Integration tests only
+make test-integration
 
-# Full test suite
-pytest tests/ -v --cov=.
+# Voice tests (requires LiveKit setup)
+make test-voice
+
+# Fast tests (no coverage)
+make test-fast
+
+# Specific test file
+pytest tests/unit/test_core.py -v
+
+# Specific test function
+pytest tests/integration/test_agents.py::TestAgentInstantiation::test_task_orchestrator_creation -v
 ```
+
+### Test Markers
+```bash
+# Run only unit tests
+pytest -m "unit"
+
+# Run everything except voice tests
+pytest -m "not voice"
+
+# Run fast tests only (exclude slow)
+pytest -m "not slow"
+```
+
+### Coverage Reports
+```bash
+# Terminal coverage report
+pytest --cov=. --cov-report=term-missing
+
+# HTML coverage report
+pytest --cov=. --cov-report=html
+# Open htmlcov/index.html in browser
+```
+
+See [tests/README.md](tests/README.md) for more testing information.
 
 ## 📚 Documentation
 
-- **Agent Development Guide**: `docs/agent_development.md`
-- **Voice Integration Guide**: `docs/voice_integration.md`
-- **MCP Tool Reference**: `docs/mcp_tools.md`
-- **API Documentation**: `docs/api_reference.md`
+### Core Documentation
+- **[API Reference](docs/API_REFERENCE.md)** - Complete API documentation for all components
+- **[Examples](examples/README.md)** - Usage examples and tutorials
+- **[Testing Guide](tests/README.md)** - Comprehensive testing documentation
+- **[Error Handling](examples/error_handling/README.md)** - Error handling patterns and best practices
+
+### Quick Links
+- **Basic Demo**: [examples/basic_demo.py](examples/basic_demo.py)
+- **Voice Demo**: [examples/voice_demo.py](examples/voice_demo.py)
+- **Error Examples**: [examples/error_handling/error_handling_demo.py](examples/error_handling/error_handling_demo.py)
+- **Development Log**: [CLAUDE.md](CLAUDE.md)
+
+### Component Documentation
+- **Agents**: See [docs/API_REFERENCE.md#agents](docs/API_REFERENCE.md#agents)
+  - TaskOrchestrator - Strategic planning
+  - TaskExecutor - Implementation
+  - TaskChecker - Quality assurance
+- **Core**: See [docs/API_REFERENCE.md#core-module](docs/API_REFERENCE.md#core-module)
+  - BaseAgent - Abstract base class
+  - AgentState - State dataclass
+  - AgentMode - Execution modes
+  - StateManager - State persistence
+- **Tools**: See [docs/API_REFERENCE.md#tools](docs/API_REFERENCE.md#tools)
+  - 6 MCP tool adapters for various capabilities
+- **Voice**: See [docs/API_REFERENCE.md#voice](docs/API_REFERENCE.md#voice)
+  - LiveKitClient - Voice integration
 
 ## 🎯 Key Features
 
