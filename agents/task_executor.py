@@ -79,12 +79,24 @@ class TaskExecutorAgent(BaseAgent, MultiModalMixin):
 
     def __init__(
         self,
-        agent_id: str = "task-executor",
+        mode: AgentMode = AgentMode.TEXT,
+        checkpointer_path: Optional[str] = None,
         state_manager: Optional[StateManager] = None,
         livekit_config: Optional[LiveKitConfig] = None
     ):
-        super().__init__(agent_id, state_manager)
-        MultiModalMixin.__init__(self, livekit_config)
+        super().__init__(
+            agent_type="task-executor",
+            mode=mode,
+            checkpointer_path=checkpointer_path
+        )
+
+        # Additional state management
+        self.state_manager = state_manager
+
+        # Voice capabilities initialization
+        self.livekit_client = None
+        if livekit_config and mode in [AgentMode.VOICE, AgentMode.HYBRID]:
+            self.livekit_client = LiveKitClient(livekit_config)
 
         # Initialize MCP tool adapters in mandatory order
         self.sequential_thinking = SequentialThinkingAdapter()
@@ -117,8 +129,8 @@ class TaskExecutorAgent(BaseAgent, MultiModalMixin):
             "code_formatter": "black"
         }
 
-    def create_graph(self) -> StateGraph:
-        """Create the executor workflow graph"""
+    def _build_graph(self) -> StateGraph:
+        """Build the executor workflow graph"""
         workflow = StateGraph(AgentState)
 
         # Add nodes for execution phases
@@ -158,6 +170,36 @@ class TaskExecutorAgent(BaseAgent, MultiModalMixin):
         )
 
         return workflow
+
+    async def process_input(self, input_data: Union[str, Dict[str, Any]]) -> Dict[str, Any]:
+        """
+        Process input and execute implementation workflow.
+
+        Args:
+            input_data: Task description (str) or structured input (dict)
+
+        Returns:
+            Dict containing implementation results and artifacts
+        """
+        # Convert string input to structured format
+        if isinstance(input_data, str):
+            task = input_data
+        else:
+            task = input_data.get("task", input_data.get("message", ""))
+
+        # Create initial state
+        initial_state = self.create_initial_state(task)
+
+        # Execute the implementation workflow
+        config = {"configurable": {"thread_id": self.session_id}}
+        result = await self.app.ainvoke(initial_state, config)
+
+        return {
+            "status": "completed",
+            "result": result,
+            "agent_type": self.agent_type,
+            "session_id": self.session_id
+        }
 
     async def _analyze_requirements(self, state: AgentState) -> AgentState:
         """Analyze implementation requirements using Sequential Thinking"""
@@ -1016,9 +1058,15 @@ Expected performance characteristics and benchmarks.
 
 # Factory function
 def create_task_executor(
-    agent_id: str = "task-executor",
+    mode: AgentMode = AgentMode.TEXT,
+    checkpointer_path: Optional[str] = None,
     state_manager: Optional[StateManager] = None,
     livekit_config: Optional[LiveKitConfig] = None
 ) -> TaskExecutorAgent:
     """Factory function to create task executor agent"""
-    return TaskExecutorAgent(agent_id, state_manager, livekit_config)
+    return TaskExecutorAgent(
+        mode=mode,
+        checkpointer_path=checkpointer_path,
+        state_manager=state_manager,
+        livekit_config=livekit_config
+    )

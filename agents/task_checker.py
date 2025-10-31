@@ -23,15 +23,15 @@ Voice Features:
 
 import asyncio
 import logging
-from typing import Dict, Any, Optional, List
+from typing import Dict, Any, Optional, List, Union
 from dataclasses import dataclass
 from enum import Enum
 
 from langgraph.graph import StateGraph, END
 from langgraph.checkpoint.sqlite import SqliteSaver
 
-from ..core.base_agent import BaseAgent, AgentState
-from ..core.multimodal_mixin import MultiModalMixin
+from ..core.base_graph import BaseAgent, AgentState, AgentMode, MultiModalMixin
+from ..voice.livekit_client import LiveKitClient, LiveKitConfig
 from ..tools.sequential_thinking_tools import SequentialThinkingAdapter
 from ..tools.serena_tools import SerenaAdapter
 from ..tools.context7_tools import Context7Adapter
@@ -92,12 +92,22 @@ class TaskCheckerAgent(BaseAgent, MultiModalMixin):
     through systematic testing and verification workflows.
     """
 
-    def __init__(self, session_id: str, livekit_client=None):
+    def __init__(
+        self,
+        mode: AgentMode = AgentMode.TEXT,
+        checkpointer_path: Optional[str] = None,
+        livekit_config: Optional[LiveKitConfig] = None
+    ):
         super().__init__(
-            agent_type="task_checker",
-            session_id=session_id,
-            livekit_client=livekit_client
+            agent_type="task-checker",
+            mode=mode,
+            checkpointer_path=checkpointer_path
         )
+
+        # Voice capabilities initialization
+        self.livekit_client = None
+        if livekit_config and mode in [AgentMode.VOICE, AgentMode.HYBRID]:
+            self.livekit_client = LiveKitClient(livekit_config)
         
         # Initialize MCP tool adapters (mandatory order)
         self.sequential_thinking = SequentialThinkingAdapter()
@@ -126,8 +136,8 @@ class TaskCheckerAgent(BaseAgent, MultiModalMixin):
             "validation status": self._handle_validation_status
         })
 
-    def create_graph(self) -> StateGraph:
-        """Create the task checker workflow graph"""
+    def _build_graph(self) -> StateGraph:
+        """Build the task checker workflow graph"""
         
         workflow = StateGraph(AgentState)
         
@@ -164,6 +174,36 @@ class TaskCheckerAgent(BaseAgent, MultiModalMixin):
         workflow.set_entry_point("analyze_validation_requirements")
         
         return workflow
+
+    async def process_input(self, input_data: Union[str, Dict[str, Any]]) -> Dict[str, Any]:
+        """
+        Process input and execute validation workflow.
+
+        Args:
+            input_data: Task description (str) or structured input (dict)
+
+        Returns:
+            Dict containing validation results and quality reports
+        """
+        # Convert string input to structured format
+        if isinstance(input_data, str):
+            task = input_data
+        else:
+            task = input_data.get("task", input_data.get("message", ""))
+
+        # Create initial state
+        initial_state = self.create_initial_state(task)
+
+        # Execute the validation workflow
+        config = {"configurable": {"thread_id": self.session_id}}
+        result = await self.app.ainvoke(initial_state, config)
+
+        return {
+            "status": "completed",
+            "result": result,
+            "agent_type": self.agent_type,
+            "session_id": self.session_id
+        }
 
     async def _analyze_validation_requirements(self, state: AgentState) -> AgentState:
         """Analyze what needs to be validated using Sequential Thinking"""
