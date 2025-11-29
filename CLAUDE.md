@@ -1,154 +1,187 @@
 # LangGraph Voice-Enabled Agent Framework - Development Log
 
 ## 🎯 Project Overview
-Voice-enabled multi-agent framework built on LangGraph with LiveKit integration and comprehensive MCP (Model Context Protocol) tool adapters. Created as part of the agent-frameworks ecosystem enhancement initiative.
+Voice-enabled multi-agent framework built on LangGraph with Cartesia voice integration and multi-LLM support.
 
-## ✅ Completed Implementation (Session 1)
+**Critical Rule: NO OpenAI dependencies anywhere in this project.**
 
-### Core MCP Tool Adapters (/tools/)
-1. **sequential_thinking_tools.py** - Systematic problem decomposition and analysis
-2. **serena_tools.py** - Code intelligence and project navigation
-3. **context7_tools.py** - Documentation and best practices research
-4. **taskmaster_tools.py** - Task management with research capabilities
-5. **shrimp_tools.py** - Advanced task planning and verification workflow
-6. **desktop_commander_tools.py** - File system operations and process management
+## ✅ Session 2 - Complete Rebuild (2025-01-28)
 
-### Voice-Enabled Agents (/agents/)
-1. **task_orchestrator.py** - Strategic planning and task delegation (248 lines)
-   - Voice commands: "orchestrate project", "analyze complexity", "delegate tasks"
-   - Implements mandatory MCP tool order: Sequential Thinking → Serena → Context7
+### Major Changes
+- **Removed all OpenAI dependencies** - Replaced with Cartesia for voice, multi-LLM for text
+- **Deleted old MCP tool adapters** - Starting fresh with voice-first agents
+- **New agent architecture** - Three specialized voice agents
 
-2. **task_executor.py** - Implementation and development execution (289 lines)
-   - Voice commands: "implement feature", "run tests", "optimize code"
-   - Comprehensive testing and validation workflow
+### Voice Module (`/voice/`)
+| File | Purpose |
+|------|---------|
+| `audio_utils.py` | PCM/WAV conversion, f32↔s16, RMS amplitude calculation |
+| `cartesia_client.py` | Cartesia TTS (sonic-2) and STT (ink-whisper) via WebSocket |
+| `livekit_client.py` | LiveKit WebRTC + Cartesia integration for real-time rooms |
+| `__init__.py` | Module exports |
 
-3. **task_checker.py** - Quality assurance and validation (401 lines)
-   - Voice commands: "run validation", "security scan", "quality report"
-   - Multi-level validation strategy with ValidationLevel enum
+### LLM Module (`/llm/`)
+| File | Purpose |
+|------|---------|
+| `provider.py` | Claude, Gemini, OpenRouter client implementations |
+| `router.py` | Task-based provider selection with automatic failover |
+| `__init__.py` | Module exports |
 
-### Core Infrastructure (/core/)
-- **base_agent.py** - Foundation class for all agents
-- **base_graph.py** - LangGraph StateGraph utilities
-- **multimodal_mixin.py** - Voice/text interaction support
-- **state_management.py** - Advanced state persistence (SQLite/Redis hybrid)
+### Core Module (`/core/`)
+| File | Purpose |
+|------|---------|
+| `base_graph.py` | BaseAgent, AgentState, MultiModalMixin, LLMIntegrationMixin |
+| `state_management.py` | SQLite/Redis hybrid state persistence |
+| `__init__.py` | Module exports |
 
-### Voice Integration (/voice/)
-- **livekit_client.py** - LiveKit WebRTC client for real-time audio
-- OpenAI Whisper integration for speech-to-text
-- OpenAI TTS for text-to-speech synthesis
-- Voice Activity Detection and automatic speech processing
+### Agents (`/agents/`)
+| Agent | Name | Specialization | Default LLM |
+|-------|------|----------------|-------------|
+| `general_assistant.py` | Atlas | Conversation, Q&A, creative writing | Claude |
+| `code_assistant.py` | Cipher | Code explanation, review, generation | Claude |
+| `task_manager.py` | Taskmaster | Task tracking, project breakdown | Gemini (fast) |
+| `voice_agent.py` | Base class | Voice + LLM capabilities | Configurable |
 
-## 🚀 GitHub Repository Setup
-- **Repository**: `ScientiaCapital/langgraph-voice-agents`
-- **Status**: Successfully pushed with comprehensive documentation
-- **Files**: README.md, .gitignore, requirements.txt, complete codebase
+### Entry Point
+- `main.py` - CLI with interactive agent selection, environment check, integration tests
 
-## 📋 Mandatory MCP Tool Order
-All agents follow the systematic workflow:
-1. **Sequential Thinking** → Problem decomposition and analysis
-2. **Serena** → Code intelligence and project navigation
-3. **Context7** → Best practices research and documentation
+## 🏗️ Architecture
 
-## 🎙️ Voice Features Implementation
-- **Strategic Commands**: Voice-controlled orchestration and planning
-- **Implementation Commands**: Voice-guided development execution
-- **Quality Commands**: Voice-activated validation and reporting
-- **Real-time Audio**: LiveKit WebRTC communication pipeline
-- **Multi-modal Support**: Seamless text and voice interaction modes
+```
+┌─────────────────────────────────────────────────────────────┐
+│                        main.py (CLI)                        │
+└─────────────────────────────────────────────────────────────┘
+                              │
+┌─────────────────────────────────────────────────────────────┐
+│                     agents/ Module                          │
+│  ┌─────────────┐  ┌─────────────┐  ┌─────────────────────┐ │
+│  │ General     │  │ Code        │  │ Task Manager        │ │
+│  │ Assistant   │  │ Assistant   │  │ (Taskmaster)        │ │
+│  │ (Atlas)     │  │ (Cipher)    │  │                     │ │
+│  └──────┬──────┘  └──────┬──────┘  └──────────┬──────────┘ │
+│         └────────────────┼─────────────────────┘           │
+│                          ▼                                  │
+│              ┌───────────────────────┐                     │
+│              │    VoiceAgent Base    │                     │
+│              │ (voice_agent.py)      │                     │
+│              └───────────────────────┘                     │
+└─────────────────────────────────────────────────────────────┘
+                              │
+         ┌────────────────────┼────────────────────┐
+         ▼                    ▼                    ▼
+┌─────────────────┐  ┌─────────────────┐  ┌─────────────────┐
+│   core/ Module  │  │   llm/ Module   │  │  voice/ Module  │
+│                 │  │                 │  │                 │
+│ • BaseAgent     │  │ • ClaudeClient  │  │ • CartesiaTTS   │
+│ • AgentState    │  │ • GeminiClient  │  │ • CartesiaSTT   │
+│ • MultiModal    │  │ • OpenRouter    │  │ • LiveKit       │
+│   Mixin         │  │ • LLMRouter     │  │   Integration   │
+│ • LLMIntegration│  │                 │  │                 │
+│   Mixin         │  │                 │  │                 │
+└─────────────────┘  └─────────────────┘  └─────────────────┘
+```
 
-## 🔄 Next Phase: Agent-Frameworks 100x Enhancement
+## 🔧 Quick Start
 
-### Current Framework Analysis
-- **LangGraph**: ✅ Complete voice + MCP implementation (938+ lines)
-- **CrewAI**: Basic role-based teams with Chinese LLMs (trading_crew.py only)
-- **AutoGen**: Simple coding team configuration (coding_team.py only)
-
-### Strategic Vision: Meta-Orchestrator
-Create unified framework that allows:
-- LangGraph agents to delegate conversations to AutoGen
-- AutoGen to request specialized roles from CrewAI
-- CrewAI to leverage LangGraph's stateful workflows
-- All frameworks share voice capabilities and MCP tools
-
-### Planned Enhancements
-1. **Voice Integration**: Extend LiveKit to CrewAI and AutoGen
-2. **MCP Tool Adapters**: Universal tool access across frameworks
-3. **Unified State Management**: Cross-framework context sharing
-4. **Meta-Orchestration Layer**: Framework interoperability conductor
-
-## 🧠 Available Subagents
-- **Task Orchestrator**: Strategic planning and complexity analysis
-- **Task Executor**: Implementation and testing execution
-- **Task Checker**: Quality assurance and validation
-- **General Purpose**: Multi-step task automation
-- **Developer Experience**: Productivity optimization
-
-## 💡 Technical Insights
-
-### Architecture Decisions
-- **StateGraph Pattern**: Enables complex workflow orchestration with clear state transitions
-- **Multimodal Mixin**: Provides seamless voice/text switching without agent duplication
-- **MCP Tool Order**: Ensures systematic problem-solving approach across all agents
-
-### Implementation Highlights
-- **Voice Command Parsing**: Natural language to agent action mapping
-- **State Persistence**: Hybrid SQLite/Redis for different data types
-- **Tool Adapter Pattern**: Consistent interface across diverse MCP servers
-
-### Performance Optimizations
-- **Async/Await**: Full async implementation for voice processing
-- **State Caching**: Redis for high-frequency operations
-- **Connection Pooling**: Efficient resource management for LiveKit
-
-## 🔧 Development Commands
-
-### Environment Setup
 ```bash
 # Install dependencies
 pip install -r requirements.txt
 
-# Set up environment
+# Configure environment
 cp .env.example .env
-# Edit .env with API keys
+# Edit .env with your API keys:
+# - CARTESIA_API_KEY (required for voice)
+# - ANTHROPIC_API_KEY (Claude)
+# - GOOGLE_API_KEY (Gemini)
+# - OPENROUTER_API_KEY (OpenRouter)
+# - LIVEKIT_* (optional, for WebRTC rooms)
 
-# Run tests
-pytest tests/ -v --cov=.
+# Run interactively
+python main.py
+
+# Start specific agent
+python main.py --agent general   # Atlas - General Assistant
+python main.py --agent code      # Cipher - Code Assistant
+python main.py --agent task      # Taskmaster - Task Manager
+
+# Text-only mode (no voice)
+python main.py --text
+
+# Run integration tests
+python main.py --test
 ```
 
-### Voice Testing
+## 📋 Environment Variables
+
+### Required (at least one LLM)
 ```bash
-# Test LiveKit integration
-python voice/test_livekit.py
-
-# Test voice commands
-python examples/voice_demo.py
+ANTHROPIC_API_KEY=sk-ant-...      # Claude
+GOOGLE_API_KEY=AIza...            # Gemini
+OPENROUTER_API_KEY=sk-or-...      # OpenRouter
 ```
 
-### MCP Tool Testing
+### Voice (required for voice mode)
 ```bash
-# Test all tool adapters
-python tools/test_all_tools.py
-
-# Test specific tool
-python tools/test_sequential_thinking.py
+CARTESIA_API_KEY=...              # Cartesia TTS/STT
 ```
 
-## 📊 Development Metrics
-- **Total Lines**: 1,500+ lines of production code
-- **Test Coverage**: Comprehensive unit and integration tests
-- **Documentation**: Complete API reference and usage examples
-- **Voice Commands**: 9+ natural language commands implemented
-- **MCP Tools**: 6 comprehensive tool adapters
+### Optional (LiveKit WebRTC)
+```bash
+LIVEKIT_URL=wss://...
+LIVEKIT_API_KEY=...
+LIVEKIT_API_SECRET=...
+```
 
-## 🎯 Session Summary
-Successfully created a comprehensive voice-enabled agent framework with:
-- Complete MCP tool integration following mandatory order
-- Three sophisticated agents with distinct specializations
-- Full voice capabilities through LiveKit integration
-- Professional GitHub repository with documentation
-- Foundation for 100x agent-frameworks enhancement
+## 🎙️ Voice Features
 
-**Next Session**: Implement CrewAI and AutoGen voice integration + Meta-Orchestrator architecture.
+### Cartesia Integration
+- **TTS Model**: `sonic-2` - High-quality voice synthesis
+- **STT Model**: `ink-whisper` - Accurate transcription
+- **Sample Rate**: 22050 Hz (TTS), 16000 Hz (STT)
+- **Format**: PCM s16le for playback compatibility
+
+### Voice Activity Detection
+- RMS amplitude-based speech detection
+- Configurable silence timeout (1.5s default)
+- Minimum speech duration filtering (0.3s)
+
+### LiveKit Support (Optional)
+- WebRTC rooms for multi-user voice sessions
+- Real-time audio streaming
+- Participant management
+
+## 🧠 LLM Provider Rankings
+
+| Task Type | 1st Choice | 2nd Choice | 3rd Choice |
+|-----------|------------|------------|------------|
+| General | Claude | Gemini | OpenRouter |
+| Coding | Claude | OpenRouter | Gemini |
+| Reasoning | Claude | OpenRouter | Gemini |
+| Fast | Gemini | OpenRouter | Claude |
+| Creative | Claude | Gemini | OpenRouter |
+
+## 📊 Project Metrics
+
+- **Python Files**: 15
+- **Lines of Code**: ~2,500
+- **Agents**: 3 specialized + 1 base class
+- **LLM Providers**: 3 (Claude, Gemini, OpenRouter)
+- **Voice Provider**: 1 (Cartesia)
+
+## 🚫 What Was Removed
+
+Session 2 removed the following from Session 1:
+- `/tools/` directory (MCP tool adapters)
+- Old agents: `task_orchestrator.py`, `task_executor.py`, `task_checker.py`
+- OpenAI Whisper integration
+- OpenAI TTS integration
+
+## 📝 Session History
+
+| Session | Date | Summary |
+|---------|------|---------|
+| 1 | 2025-01-21 | Initial implementation with MCP tools and OpenAI voice |
+| 2 | 2025-01-28 | Complete rebuild with Cartesia voice, multi-LLM, no OpenAI |
 
 ---
-*Last Updated: 2025-01-21 - Session 1 Complete*
+*Last Updated: 2025-01-28 - Session 2 Complete*

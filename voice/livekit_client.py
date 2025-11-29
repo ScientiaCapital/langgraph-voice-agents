@@ -1,22 +1,27 @@
 """
-LiveKit client integration for real-time voice communication in agents.
-Handles WebRTC connections, audio processing, and room management.
+LiveKit client integration for real-time voice communication.
+Uses Cartesia for TTS/STT - NO OpenAI.
+
+LiveKit provides WebRTC transport.
+Cartesia provides voice synthesis and recognition.
 """
 
 import asyncio
 import logging
-from typing import Optional, Dict, Any, Callable, List, Union
-from dataclasses import dataclass
+import os
+from typing import Optional, Dict, Any, Callable, List, AsyncGenerator
+from dataclasses import dataclass, field
 from enum import Enum
-import json
-import wave
-import io
 
 from livekit import rtc, api
-import numpy as np
-from openai import AsyncOpenAI
-import asyncio
-import websockets
+
+from voice.cartesia_client import CartesiaClient, CartesiaConfig
+from voice.audio_utils import (
+    convert_pcm_to_wav,
+    convert_s16_to_f32,
+    calculate_rms_amplitude,
+    chunk_audio,
+)
 
 logger = logging.getLogger(__name__)
 
@@ -33,234 +38,225 @@ class ConnectionStatus(Enum):
 @dataclass
 class LiveKitConfig:
     """Configuration for LiveKit client"""
-    url: str
-    api_key: str
-    api_secret: str
-    room_name: str
-    participant_name: str
+    # LiveKit connection
+    url: Optional[str] = None
+    api_key: Optional[str] = None
+    api_secret: Optional[str] = None
+    room_name: str = "voice-agent-room"
+    participant_name: str = "agent"
 
     # Audio settings
     sample_rate: int = 16000
     channels: int = 1
     bits_per_sample: int = 16
 
-    # Voice processing
+    # Voice activity detection
     voice_activity_threshold: float = 0.01
-    silence_timeout: float = 2.0
+    silence_timeout: float = 1.5
 
-    # TTS/STT settings
-    openai_api_key: Optional[str] = None
-    tts_voice: str = "alloy"
-    tts_model: str = "tts-1"
-    stt_model: str = "whisper-1"
+    # Cartesia settings
+    cartesia_api_key: Optional[str] = None
+    cartesia_voice_id: Optional[str] = None
 
-
-class AudioProcessor:
-    """Handles audio processing for voice interactions"""
-
-    def __init__(self, config: LiveKitConfig):
-        self.config = config
-        self.audio_buffer = []
-        self.is_recording = False
-        self.last_audio_time = 0
-
-    def detect_voice_activity(self, audio_data: bytes) -> bool:
-        """Simple voice activity detection"""
-        try:
-            # Convert bytes to numpy array
-            audio_array = np.frombuffer(audio_data, dtype=np.int16)
-
-            # Calculate RMS (root mean square) for amplitude
-            rms = np.sqrt(np.mean(audio_array**2))
-
-            # Normalize to 0-1 range
-            normalized_rms = rms / 32768.0
-
-            return normalized_rms > self.config.voice_activity_threshold
-
-        except Exception as e:
-            logger.error(f"Voice activity detection failed: {e}")
-            return False
-
-    def start_recording(self):
-        """Start recording audio"""
-        self.is_recording = True
-        self.audio_buffer = []
-        self.last_audio_time = asyncio.get_event_loop().time()
-
-    def stop_recording(self) -> bytes:
-        """Stop recording and return audio data"""
-        self.is_recording = False
-
-        if not self.audio_buffer:
-            return b""
-
-        # Combine all audio chunks
-        combined_audio = b"".join(self.audio_buffer)
-        self.audio_buffer = []
-
-        return combined_audio
-
-    def add_audio_chunk(self, audio_data: bytes):
-        """Add audio chunk to buffer"""
-        if self.is_recording:
-            self.audio_buffer.append(audio_data)
-            self.last_audio_time = asyncio.get_event_loop().time()
-
-    def check_silence_timeout(self) -> bool:
-        """Check if silence timeout has been reached"""
-        if not self.is_recording:
-            return False
-
-        current_time = asyncio.get_event_loop().time()
-        return (current_time - self.last_audio_time) > self.config.silence_timeout
-
-    def create_wav_file(self, audio_data: bytes) -> bytes:
-        """Create WAV file from raw audio data"""
-        try:
-            buffer = io.BytesIO()
-
-            with wave.open(buffer, 'wb') as wav_file:
-                wav_file.setnchannels(self.config.channels)
-                wav_file.setsampwidth(self.config.bits_per_sample // 8)
-                wav_file.setframerate(self.config.sample_rate)
-                wav_file.writeframes(audio_data)
-
-            return buffer.getvalue()
-
-        except Exception as e:
-            logger.error(f"WAV file creation failed: {e}")
-            return b""
+    def __post_init__(self):
+        # Load from environment if not provided
+        if self.url is None:
+            self.url = os.getenv("LIVEKIT_URL")
+        if self.api_key is None:
+            self.api_key = os.getenv("LIVEKIT_API_KEY")
+        if self.api_secret is None:
+            self.api_secret = os.getenv("LIVEKIT_API_SECRET")
+        if self.cartesia_api_key is None:
+            self.cartesia_api_key = os.getenv("CARTESIA_API_KEY")
 
 
-class VoiceProcessor:
-    """Handles speech-to-text and text-to-speech operations"""
+class AudioBuffer:
+    """
+    Manages audio buffering with voice activity detection.
+    Collects audio chunks during speech and returns complete utterances.
+    """
 
-    def __init__(self, config: LiveKitConfig):
-        self.config = config
-        self.openai_client = None
+    def __init__(
+        self,
+        voice_threshold: float = 0.01,
+        silence_timeout: float = 1.5,
+        min_speech_duration: float = 0.3
+    ):
+        self.voice_threshold = voice_threshold
+        self.silence_timeout = silence_timeout
+        self.min_speech_duration = min_speech_duration
 
-        if config.openai_api_key:
-            self.openai_client = AsyncOpenAI(api_key=config.openai_api_key)
+        self._buffer: List[bytes] = []
+        self._is_speaking = False
+        self._speech_start_time: Optional[float] = None
+        self._last_voice_time: Optional[float] = None
 
-    async def speech_to_text(self, audio_data: bytes) -> str:
-        """Convert speech to text using OpenAI Whisper"""
-        if not self.openai_client:
-            raise RuntimeError("OpenAI client not configured")
+    def add_audio(self, audio_data: bytes, timestamp: float) -> Optional[bytes]:
+        """
+        Add audio data and return complete utterance if speech ended.
 
-        try:
-            # Create a file-like object from audio data
-            audio_file = io.BytesIO(audio_data)
-            audio_file.name = "audio.wav"
+        Args:
+            audio_data: PCM s16le audio bytes
+            timestamp: Current timestamp in seconds
 
-            # Use OpenAI Whisper for transcription
-            transcript = await self.openai_client.audio.transcriptions.create(
-                model=self.config.stt_model,
-                file=audio_file,
-                response_format="text"
-            )
+        Returns:
+            Complete audio utterance if speech ended, None otherwise
+        """
+        rms = calculate_rms_amplitude(audio_data)
+        has_voice = rms > self.voice_threshold
 
-            logger.debug(f"Transcribed: {transcript}")
-            return transcript.strip()
+        if has_voice:
+            if not self._is_speaking:
+                # Speech started
+                self._is_speaking = True
+                self._speech_start_time = timestamp
+                self._buffer = []
+                logger.debug("Speech started")
 
-        except Exception as e:
-            logger.error(f"Speech-to-text failed: {e}")
-            return ""
+            self._buffer.append(audio_data)
+            self._last_voice_time = timestamp
 
-    async def text_to_speech(self, text: str) -> bytes:
-        """Convert text to speech using OpenAI TTS"""
-        if not self.openai_client:
-            raise RuntimeError("OpenAI client not configured")
+        elif self._is_speaking:
+            # Add to buffer even during short pauses
+            self._buffer.append(audio_data)
 
-        try:
-            response = await self.openai_client.audio.speech.create(
-                model=self.config.tts_model,
-                voice=self.config.tts_voice,
-                input=text,
-                response_format="wav"
-            )
+            # Check for end of speech
+            if self._last_voice_time and (timestamp - self._last_voice_time) > self.silence_timeout:
+                # Speech ended - check minimum duration
+                speech_duration = timestamp - self._speech_start_time
+                if speech_duration >= self.min_speech_duration:
+                    audio = b''.join(self._buffer)
+                    self._reset()
+                    logger.debug(f"Speech ended, duration: {speech_duration:.2f}s")
+                    return audio
+                else:
+                    # Too short, discard
+                    logger.debug(f"Speech too short ({speech_duration:.2f}s), discarding")
+                    self._reset()
 
-            return response.content
+        return None
 
-        except Exception as e:
-            logger.error(f"Text-to-speech failed: {e}")
-            return b""
+    def _reset(self):
+        """Reset buffer state"""
+        self._buffer = []
+        self._is_speaking = False
+        self._speech_start_time = None
+        self._last_voice_time = None
+
+    def force_end(self) -> Optional[bytes]:
+        """Force end current utterance and return audio"""
+        if self._buffer:
+            audio = b''.join(self._buffer)
+            self._reset()
+            return audio
+        return None
 
 
-class LiveKitClient:
-    """Main LiveKit client for agent voice interactions"""
+class LiveKitCartesiaClient:
+    """
+    LiveKit client with Cartesia voice integration.
 
-    def __init__(self, config: LiveKitConfig):
-        self.config = config
-        self.room = None
+    Combines:
+    - LiveKit: WebRTC transport for real-time audio
+    - Cartesia: TTS (sonic-2) and STT (ink-whisper)
+
+    NO OpenAI dependencies.
+    """
+
+    def __init__(self, config: Optional[LiveKitConfig] = None):
+        self.config = config or LiveKitConfig()
+        self.room: Optional[rtc.Room] = None
         self.status = ConnectionStatus.DISCONNECTED
 
-        # Audio processing
-        self.audio_processor = AudioProcessor(config)
-        self.voice_processor = VoiceProcessor(config)
+        # Cartesia client for TTS/STT
+        cartesia_config = CartesiaConfig(
+            api_key=self.config.cartesia_api_key,
+            voice_id=self.config.cartesia_voice_id or "a0e99841-438c-4a64-b679-ae501e7d6091",
+            stt_sample_rate=self.config.sample_rate,
+        )
+        self._cartesia = CartesiaClient(cartesia_config)
 
-        # Event handlers
-        self.on_audio_received: Optional[Callable] = None
-        self.on_transcription_complete: Optional[Callable] = None
-        self.on_participant_connected: Optional[Callable] = None
-        self.on_participant_disconnected: Optional[Callable] = None
+        # Audio management
+        self._audio_buffer = AudioBuffer(
+            voice_threshold=self.config.voice_activity_threshold,
+            silence_timeout=self.config.silence_timeout,
+        )
 
-        # Internal state
-        self._audio_track = None
-        self._audio_source = None
-        self._current_session = None
+        # Audio publishing
+        self._audio_source: Optional[rtc.AudioSource] = None
+        self._audio_track: Optional[rtc.LocalAudioTrack] = None
+
+        # Event callbacks
+        self.on_transcription: Optional[Callable[[str], Any]] = None
+        self.on_participant_connected: Optional[Callable[[rtc.Participant], Any]] = None
+        self.on_participant_disconnected: Optional[Callable[[rtc.Participant], Any]] = None
+
+        # Processing state
+        self._processing_task: Optional[asyncio.Task] = None
+        self._running = False
 
     async def connect(self) -> bool:
-        """Connect to LiveKit room"""
+        """Connect to LiveKit room and initialize Cartesia"""
+        if not self.config.url or not self.config.api_key or not self.config.api_secret:
+            raise ValueError(
+                "LiveKit configuration incomplete. Set LIVEKIT_URL, "
+                "LIVEKIT_API_KEY, and LIVEKIT_API_SECRET."
+            )
+
         try:
             self.status = ConnectionStatus.CONNECTING
 
-            # Create room instance
-            self.room = rtc.Room()
+            # Connect Cartesia
+            await self._cartesia.connect()
 
-            # Set up event handlers
+            # Create and connect LiveKit room
+            self.room = rtc.Room()
             self._setup_event_handlers()
 
-            # Connect to room
-            await self.room.connect(
-                url=self.config.url,
-                token=self._generate_token()
-            )
+            token = self._generate_token()
+            await self.room.connect(self.config.url, token)
 
-            # Set up audio track
-            await self._setup_audio()
+            # Set up audio publishing
+            await self._setup_audio_track()
 
             self.status = ConnectionStatus.CONNECTED
+            self._running = True
+
             logger.info(f"Connected to LiveKit room: {self.config.room_name}")
             return True
 
         except Exception as e:
-            logger.error(f"Failed to connect to LiveKit: {e}")
+            logger.error(f"Failed to connect: {e}")
             self.status = ConnectionStatus.FAILED
             return False
 
     async def disconnect(self):
-        """Disconnect from LiveKit room"""
-        try:
-            if self.room:
-                await self.room.disconnect()
-                self.room = None
+        """Disconnect from LiveKit and Cartesia"""
+        self._running = False
 
-            self.status = ConnectionStatus.DISCONNECTED
-            logger.info("Disconnected from LiveKit")
+        if self._processing_task:
+            self._processing_task.cancel()
+            try:
+                await self._processing_task
+            except asyncio.CancelledError:
+                pass
 
-        except Exception as e:
-            logger.error(f"Error during disconnect: {e}")
+        if self.room:
+            await self.room.disconnect()
+            self.room = None
+
+        await self._cartesia.disconnect()
+
+        self.status = ConnectionStatus.DISCONNECTED
+        logger.info("Disconnected from LiveKit")
 
     def _generate_token(self) -> str:
         """Generate JWT token for LiveKit authentication"""
-        from livekit.api import AccessToken, VideoGrants
-
-        token = AccessToken(self.config.api_key, self.config.api_secret)
+        token = api.AccessToken(self.config.api_key, self.config.api_secret)
         token.with_identity(self.config.participant_name)
         token.with_name(self.config.participant_name)
 
-        grants = VideoGrants(
+        grants = api.VideoGrants(
             room_join=True,
             room=self.config.room_name,
             can_publish=True,
@@ -271,227 +267,219 @@ class LiveKitClient:
         return token.to_jwt()
 
     def _setup_event_handlers(self):
-        """Set up LiveKit event handlers"""
+        """Set up LiveKit room event handlers"""
 
         @self.room.on("participant_connected")
-        def on_participant_connected(participant):
+        def on_connected(participant: rtc.Participant):
             logger.info(f"Participant connected: {participant.identity}")
             if self.on_participant_connected:
-                asyncio.create_task(self.on_participant_connected(participant))
+                asyncio.create_task(
+                    self._safe_callback(self.on_participant_connected, participant)
+                )
 
         @self.room.on("participant_disconnected")
-        def on_participant_disconnected(participant):
+        def on_disconnected(participant: rtc.Participant):
             logger.info(f"Participant disconnected: {participant.identity}")
             if self.on_participant_disconnected:
-                asyncio.create_task(self.on_participant_disconnected(participant))
-
-        @self.room.on("track_published")
-        def on_track_published(publication, participant):
-            if publication.kind == rtc.TrackKind.KIND_AUDIO:
-                logger.info(f"Audio track published by {participant.identity}")
+                asyncio.create_task(
+                    self._safe_callback(self.on_participant_disconnected, participant)
+                )
 
         @self.room.on("track_subscribed")
-        def on_track_subscribed(track, publication, participant):
+        def on_track(track, publication, participant):
             if isinstance(track, rtc.AudioTrack):
-                logger.info(f"Subscribed to audio track from {participant.identity}")
+                logger.info(f"Subscribed to audio from {participant.identity}")
                 asyncio.create_task(self._handle_audio_track(track))
 
-    async def _setup_audio(self):
-        """Set up audio publishing"""
+    async def _safe_callback(self, callback: Callable, *args):
+        """Execute callback safely with error handling"""
         try:
-            # Create audio source
-            self._audio_source = rtc.AudioSource(
-                sample_rate=self.config.sample_rate,
-                num_channels=self.config.channels
-            )
-
-            # Create audio track
-            self._audio_track = rtc.LocalAudioTrack.create_audio_track(
-                "agent-audio", self._audio_source
-            )
-
-            # Publish audio track
-            await self.room.local_participant.publish_track(
-                self._audio_track,
-                rtc.TrackPublishOptions(source=rtc.TrackSource.SOURCE_MICROPHONE)
-            )
-
-            logger.info("Audio track published")
-
+            result = callback(*args)
+            if asyncio.iscoroutine(result):
+                await result
         except Exception as e:
-            logger.error(f"Failed to set up audio: {e}")
+            logger.error(f"Callback error: {e}")
+
+    async def _setup_audio_track(self):
+        """Set up local audio track for publishing"""
+        self._audio_source = rtc.AudioSource(
+            sample_rate=self.config.sample_rate,
+            num_channels=self.config.channels
+        )
+
+        self._audio_track = rtc.LocalAudioTrack.create_audio_track(
+            "agent-voice",
+            self._audio_source
+        )
+
+        options = rtc.TrackPublishOptions(
+            source=rtc.TrackSource.SOURCE_MICROPHONE
+        )
+
+        await self.room.local_participant.publish_track(
+            self._audio_track,
+            options
+        )
+
+        logger.info("Audio track published")
 
     async def _handle_audio_track(self, track: rtc.AudioTrack):
-        """Handle incoming audio track"""
+        """Handle incoming audio track and process with Cartesia STT"""
+        stream = rtc.AudioStream(track)
+        current_time = 0.0
+        frame_duration = 0.02  # 20ms frames
+
+        async for frame in stream:
+            if not self._running:
+                break
+
+            audio_data = frame.data.tobytes()
+            current_time += frame_duration
+
+            # Check for complete utterance
+            utterance = self._audio_buffer.add_audio(audio_data, current_time)
+
+            if utterance:
+                # Transcribe with Cartesia
+                await self._process_utterance(utterance)
+
+    async def _process_utterance(self, audio_data: bytes):
+        """Process complete utterance through Cartesia STT"""
         try:
-            audio_stream = rtc.AudioStream(track)
+            transcription = await self._cartesia.listen(audio_data)
 
-            async for frame in audio_stream:
-                audio_data = frame.data.tobytes()
-
-                # Process audio data
-                if self.audio_processor.detect_voice_activity(audio_data):
-                    if not self.audio_processor.is_recording:
-                        self.audio_processor.start_recording()
-
-                    self.audio_processor.add_audio_chunk(audio_data)
-
-                elif self.audio_processor.is_recording:
-                    # Check for silence timeout
-                    if self.audio_processor.check_silence_timeout():
-                        audio_recording = self.audio_processor.stop_recording()
-
-                        if audio_recording:
-                            await self._process_voice_input(audio_recording)
-
-                # Call custom handler if set
-                if self.on_audio_received:
-                    await self.on_audio_received(audio_data)
+            if transcription and self.on_transcription:
+                await self._safe_callback(self.on_transcription, transcription)
 
         except Exception as e:
-            logger.error(f"Error handling audio track: {e}")
-
-    async def _process_voice_input(self, audio_data: bytes):
-        """Process recorded voice input"""
-        try:
-            # Convert to WAV format
-            wav_data = self.audio_processor.create_wav_file(audio_data)
-
-            if not wav_data:
-                return
-
-            # Transcribe audio
-            transcription = await self.voice_processor.speech_to_text(wav_data)
-
-            if transcription and self.on_transcription_complete:
-                await self.on_transcription_complete(transcription)
-
-        except Exception as e:
-            logger.error(f"Error processing voice input: {e}")
+            logger.error(f"Transcription error: {e}")
 
     async def speak(self, text: str) -> bool:
-        """Convert text to speech and play it"""
+        """
+        Synthesize text and publish to LiveKit room.
+
+        Args:
+            text: Text to speak
+
+        Returns:
+            True if successful
+        """
+        if not self._audio_source:
+            logger.error("Audio source not available")
+            return False
+
         try:
-            if not self._audio_source:
-                logger.error("Audio source not available")
-                return False
+            # Stream audio chunks from Cartesia
+            async for chunk in self._cartesia.speak(text):
+                if not self._running:
+                    break
 
-            # Generate speech
-            audio_data = await self.voice_processor.text_to_speech(text)
+                # Cartesia returns s16le, create audio frame
+                # LiveKit expects specific frame format
+                samples_per_channel = len(chunk) // 2  # 2 bytes per s16 sample
 
-            if not audio_data:
-                return False
+                frame = rtc.AudioFrame(
+                    data=chunk,
+                    sample_rate=22050,  # Cartesia TTS sample rate
+                    num_channels=1,
+                    samples_per_channel=samples_per_channel
+                )
 
-            # Convert to audio frame format
-            audio_array = np.frombuffer(audio_data, dtype=np.int16)
+                await self._audio_source.capture_frame(frame)
 
-            # Create audio frame
-            frame = rtc.AudioFrame(
-                data=audio_array,
-                sample_rate=self.config.sample_rate,
-                num_channels=self.config.channels,
-                samples_per_channel=len(audio_array) // self.config.channels
-            )
-
-            # Publish audio frame
-            await self._audio_source.capture_frame(frame)
-
-            logger.debug(f"Spoke: {text}")
+            logger.debug(f"Spoke: {text[:50]}...")
             return True
 
         except Exception as e:
-            logger.error(f"Failed to speak: {e}")
+            logger.error(f"Speech synthesis error: {e}")
             return False
 
-    async def transcribe_audio(self, audio_data: bytes) -> str:
-        """Transcribe audio data to text"""
-        wav_data = self.audio_processor.create_wav_file(audio_data)
-        return await self.voice_processor.speech_to_text(wav_data)
+    async def transcribe(self, audio_data: bytes) -> str:
+        """
+        Transcribe audio data using Cartesia STT.
 
-    async def synthesize_speech(self, text: str) -> bytes:
-        """Synthesize speech from text"""
-        return await self.voice_processor.text_to_speech(text)
+        Args:
+            audio_data: PCM s16le audio bytes
+
+        Returns:
+            Transcribed text
+        """
+        return await self._cartesia.listen(audio_data)
 
     def is_connected(self) -> bool:
-        """Check if client is connected"""
+        """Check if connected to LiveKit"""
         return self.status == ConnectionStatus.CONNECTED
 
     def get_participants(self) -> List[rtc.Participant]:
-        """Get list of participants in room"""
+        """Get list of room participants"""
         if not self.room:
             return []
-
-        return list(self.room.participants.values())
+        return list(self.room.remote_participants.values())
 
     def get_room_info(self) -> Dict[str, Any]:
-        """Get room information"""
+        """Get current room information"""
         if not self.room:
-            return {}
+            return {"status": self.status.value}
 
         return {
             "room_name": self.config.room_name,
-            "participant_count": len(self.room.participants),
-            "connection_status": self.status.value,
-            "local_participant": self.room.local_participant.identity if self.room.local_participant else None
+            "status": self.status.value,
+            "participant_count": len(self.room.remote_participants) + 1,
+            "local_participant": self.config.participant_name,
+            "remote_participants": [
+                p.identity for p in self.room.remote_participants.values()
+            ]
         }
 
+    async def __aenter__(self):
+        await self.connect()
+        return self
 
-# Utility functions
-
-def create_room_name(agent_type: str, session_id: str) -> str:
-    """Create standardized room name"""
-    return f"agent-framework-{agent_type}-{session_id}"
+    async def __aexit__(self, exc_type, exc_val, exc_tb):
+        await self.disconnect()
 
 
-async def create_livekit_client(
-    agent_type: str,
-    session_id: str,
-    participant_name: str,
-    livekit_url: str,
-    api_key: str,
-    api_secret: str,
-    openai_api_key: Optional[str] = None
-) -> LiveKitClient:
-    """Factory function to create and connect LiveKit client"""
+# Factory function for easy creation
+async def create_voice_session(
+    room_name: str,
+    participant_name: str = "agent",
+    on_transcription: Optional[Callable[[str], Any]] = None,
+    livekit_url: Optional[str] = None,
+    livekit_api_key: Optional[str] = None,
+    livekit_api_secret: Optional[str] = None,
+    cartesia_api_key: Optional[str] = None,
+    cartesia_voice_id: Optional[str] = None,
+) -> LiveKitCartesiaClient:
+    """
+    Create and connect a voice session.
 
+    Args:
+        room_name: LiveKit room name
+        participant_name: Agent's participant name
+        on_transcription: Callback for transcribed speech
+        livekit_url: LiveKit server URL
+        livekit_api_key: LiveKit API key
+        livekit_api_secret: LiveKit API secret
+        cartesia_api_key: Cartesia API key
+        cartesia_voice_id: Cartesia voice ID for TTS
+
+    Returns:
+        Connected LiveKitCartesiaClient
+    """
     config = LiveKitConfig(
         url=livekit_url,
-        api_key=api_key,
-        api_secret=api_secret,
-        room_name=create_room_name(agent_type, session_id),
+        api_key=livekit_api_key,
+        api_secret=livekit_api_secret,
+        room_name=room_name,
         participant_name=participant_name,
-        openai_api_key=openai_api_key
+        cartesia_api_key=cartesia_api_key,
+        cartesia_voice_id=cartesia_voice_id,
     )
 
-    client = LiveKitClient(config)
+    client = LiveKitCartesiaClient(config)
+    client.on_transcription = on_transcription
 
     if await client.connect():
         return client
     else:
-        raise RuntimeError("Failed to connect to LiveKit")
-
-
-# Event handler decorators
-
-def on_voice_command(client: LiveKitClient):
-    """Decorator for voice command handlers"""
-    def decorator(func):
-        async def wrapper(transcription: str):
-            return await func(transcription)
-
-        client.on_transcription_complete = wrapper
-        return func
-
-    return decorator
-
-
-def on_participant_join(client: LiveKitClient):
-    """Decorator for participant join handlers"""
-    def decorator(func):
-        async def wrapper(participant):
-            return await func(participant)
-
-        client.on_participant_connected = wrapper
-        return func
-
-    return decorator
+        raise RuntimeError("Failed to create voice session")
